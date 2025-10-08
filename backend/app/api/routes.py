@@ -10,6 +10,7 @@ from app.core.config import get_settings
 from app.services.storage import store_file, delete_file
 from app.services import retrieval, rag
 from app.services import debug_buffer
+from app.services import local_models
 import httpx
 from app.services.retrieval import delete_document_vectors
 from app.core import runtime_state as rt_state
@@ -210,6 +211,12 @@ async def diagnostics(db: AsyncSession = Depends(get_db)):
         "documents_by_status": by_status,
         "any_processing": any_processing,
         "gemini": gem,
+        "local_models": {
+            "embedding_fallback_enabled": settings.enable_local_embedding_fallback,
+            "generation_fallback_enabled": settings.enable_local_generation_fallback,
+            "embedding_priority": settings.local_embedding_models_priority,
+            "generation_priority": settings.local_generation_models_priority,
+        }
     }
 
 
@@ -287,13 +294,25 @@ async def ask(req: AskRequest):
     # Adaptive broad-question enrichment: if user asks a summarization/broad intent question and we have too few chunks, broaden context.
     broad_q = req.question.lower().strip().rstrip('?')
     BROAD_PATTERNS = [
-        'what is this document about',
-        'what is the document about',
-        'summarize this document',
-        'give me a summary',
-        'overall summary',
-        'summary of the document'
-    ]
+            'what is this document about',
+            'what is the document about',
+            'summarize this document',
+            'give me a summary',
+            'overall summary',
+            'summary of the document',
+            r"overall summary",
+            r"summarize",
+            r"overview",
+            r"what is this about",
+            r"what is this document about",
+            r"what is this pdf about",
+            r"give me (an )?overview",
+            r"describe (this|the) (file|document|pdf)",
+            r"all about",
+            r"high level",
+            r"executive summary",
+            r"key points",
+        ]
     if len(filtered) < 2 and results and any(p in broad_q for p in BROAD_PATTERNS):
         # Take top up to 3 distinct chunks even if below threshold (context amplification)
         enriched = results[: min(3, len(results))]
@@ -454,3 +473,13 @@ async def admin_reset(token: str):
     st = rmod.stats()
     success = (st.get("vectors") == 0 and st.get("lexical_chunks") == 0 and ("qdrant_points" not in st or st.get("qdrant_points") == 0))
     return {"status": "reset" if success else "partial", "message": "All stores cleared" if success else "Partial cleanup (some resources not cleared)", "retrieval_stats": st, "documents_remaining": (len(memdb.list_documents()) if settings.use_in_memory else None)}
+
+
+@router.post("/local-models/reset")
+async def local_models_reset():
+    """Reset in-memory cached local embedding / generation models to re-attempt loading after installing dependencies."""
+    try:
+        local_models.reset_local_models()
+        return {"status": "ok", "message": "Local model caches cleared; next request will attempt reload."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reset failed: {e}")
