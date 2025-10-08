@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@keyframes fade-in { from { opacity:0; transform: translateY(4px);} to {opacity:1; transform: translateY(0);} }
+.animate-fade-in { animation: fade-in 0.25s ease-out; }
+
+/* Scrollbar styling */
+*::-webkit-scrollbar { width: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: #c1c1c1; border-radius: 4px; }
+*::-webkit-scrollbar-thumb:hover { background: #a1a1a1; }
+
+
+body { font-family: system-ui, sans-serif; }
