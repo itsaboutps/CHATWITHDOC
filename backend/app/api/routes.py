@@ -9,6 +9,8 @@ from app.schemas.base import UploadResponse, DocumentOut, AskRequest, Answer, He
 from app.core.config import get_settings
 from app.services.storage import store_file, delete_file
 from app.services import retrieval, rag
+from app.services import debug_buffer
+import httpx
 from app.services.retrieval import delete_document_vectors
 from app.core import runtime_state as rt_state
 from app.services import embeddings as emb_mod
@@ -91,6 +93,52 @@ async def gemini_model_diagnostics():
     if not gen.endswith("-latest"):
         candidates.append(gen + "-latest")
     return {"configured": settings_models, "generation_candidates": candidates}
+
+
+@router.get("/gemini/models/available")
+async def gemini_models_available():
+    """Fetch the list of models the current API key can see and classify embedding vs generation.
+    Provides availability flags for the configured embedding & generation models.
+    """
+    runtime_key = rt_state.get_gemini_key(settings.gemini_api_key)
+    if not runtime_key:
+        raise HTTPException(status_code=400, detail="No Gemini API key set (use POST /gemini/key)")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={runtime_key}"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Model list fetch failed: {e}")
+    models = data.get('models', [])
+    names = [m.get('name','') for m in models if m.get('name')]
+    # Simple classification heuristics
+    embedding = [n for n in names if 'embedding' in n]
+    generation = [n for n in names if 'gemini' in n and 'embedding' not in n]
+    other = sorted(set(names) - set(embedding) - set(generation))
+    # Normalize configured names to both raw & with models/ prefix
+    cfg_gen = settings.generation_model
+    cfg_emb = settings.embedding_model
+    def is_available(cfg: str):
+        if cfg in names:
+            return True
+        pref = cfg if cfg.startswith('models/') else f'models/{cfg}'
+        alt = cfg.split('/')[-1]
+        variants = {cfg, pref, alt, pref + ('-latest' if not pref.endswith('-latest') else '')}
+        return any(v in names for v in variants)
+    availability = {
+        'generation_model': { 'configured': cfg_gen, 'available': is_available(cfg_gen) },
+        'embedding_model': { 'configured': cfg_emb, 'available': is_available(cfg_emb) },
+    }
+    return {
+        'runtime_key_active': True,
+        'total_models': len(names),
+        'generation_models': generation,
+        'embedding_models': embedding,
+        'other_models': other,
+        'availability': availability,
+    }
 
 
 @router.post("/gemini/models/config")
@@ -287,9 +335,45 @@ async def ask(req: AskRequest):
     answer["document_ids_used"] = list({c.get("document_id") for c in filtered if c.get("document_id") is not None})
     answer["latency_ms"] = int((time.time() - start) * 1000)
     answer.setdefault("retrieved", len(filtered))
+    # Debug buffer capture
+    try:
+        debug_buffer.record({
+            'question': req.question,
+            'document_ids_filter': req.document_ids,
+            'answer': answer.get('answer'),
+            'answer_type': answer.get('answer_type'),
+            'retrieved_used': len(filtered),
+            'latency_ms': answer.get('latency_ms'),
+            'generation_mode': answer.get('generation_mode'),
+            'embed_mode': answer.get('embed_mode'),
+            'candidates': [
+                {
+                    'rank': idx+1,
+                    'hybrid_score': round(c.get('hybrid_score', c.get('score', 0)),4),
+                    'accepted': c in filtered,
+                    'doc': c.get('document_id'),
+                    'page': c.get('page'),
+                    'mode': c.get('mode'),
+                    'text': (c.get('text') or '')[:260]
+                }
+                for idx, c in enumerate(results[:settings.top_k])
+            ],
+            'threshold': settings.similarity_threshold,
+        })
+    except Exception:
+        pass
     if settings.pipeline_debug:
         logger.info(f"[PIPELINE][ASK][done] retrieved={answer.get('retrieved')} latency_ms={answer.get('latency_ms')} generation_mode={answer.get('generation_mode')} embed_mode={answer.get('embed_mode')}")
     return answer
+
+@router.get("/debug/last")
+async def debug_last(limit: int = 5):
+    """Return last N ask interactions (for debugging answer quality)."""
+    limit = max(1, min(limit, 20))
+    return {
+        'limit': limit,
+        'entries': debug_buffer.last(limit)
+    }
 
 
 @router.get("/summarize/{document_id}", response_model=Answer)

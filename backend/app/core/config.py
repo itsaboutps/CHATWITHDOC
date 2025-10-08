@@ -5,9 +5,16 @@ from typing import Optional
 
 class Settings(BaseSettings):
     gemini_api_key: str = ""
-    embedding_model: str = "text-embedding-004"
-    generation_model: str = "gemini-flash-latest"
+    embedding_model: str = "text-embedding-004"  # available embedding model
+    generation_model: str = "gemini-2.5-flash"   # upgraded default from gemini-flash-latest
     embedding_rate_delay_ms: int = 150
+
+    # Local fallback models (for offline / keyless operation)
+    enable_local_embedding_fallback: bool = True
+    local_embedding_model: str = "all-MiniLM-L6-v2"  # sentence-transformers model name
+    enable_local_generation_fallback: bool = True
+    local_generation_model: str = "gpt4all-falcon-q4_0"  # gpt4all model file name or alias
+    local_generation_max_tokens: int = 512
 
     # Set use_in_memory=True to bypass any SQL database usage.
     use_in_memory: bool = True

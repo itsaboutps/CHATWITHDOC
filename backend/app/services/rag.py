@@ -4,6 +4,7 @@ import time
 from typing import List, Dict
 from app.core.config import get_settings
 from app.core import runtime_state
+from app.services import local_models
 from loguru import logger
 
 settings = get_settings()
@@ -76,7 +77,30 @@ async def generate_answer(question: str, context_chunks: List[Dict]):
             continue
     if data is None:
         e = error_obj or Exception("All generation attempts failed")
-        # Local fallback: extract the most common sentences mentioning question terms
+        # Attempt local generation fallback first
+        local_ctx = '\n'.join([c['text'][:800] for c in context_chunks])
+        local_prompt = f"You are a grounding assistant. Use ONLY the provided context to answer. If answer not present say OUT_OF_SCOPE.\nQuestion: {question}\nContext:\n{local_ctx}\nAnswer:"  # noqa
+        local_answer = None
+        if settings.enable_local_generation_fallback:
+            if getattr(settings, 'pipeline_debug', False):
+                logger.info("[PIPELINE][GENERATE][fallback_try] strategy=local-llm model=%s" % settings.local_generation_model)
+            local_answer = local_models.local_generate(local_prompt, max_tokens= settings.local_generation_max_tokens)
+        if local_answer:
+            if getattr(settings, 'pipeline_debug', False):
+                logger.info("[PIPELINE][GENERATE][fallback_used] mode=local-llm")
+            return {
+                "answer": local_answer.strip(),
+                "answer_type": "contextual",
+                "sources": [f"page:{c['page']}" for c in context_chunks],
+                "latency_ms": int((time.time() - start) * 1000),
+                "retrieved": len(context_chunks),
+                "generation_mode": "local-llm",
+                "fallback_reason": f"gemini_error: {e}"[:160],
+                "tried_models": tried_models,
+            }
+        # Heuristic fallback if no local model
+        if getattr(settings, 'pipeline_debug', False):
+            logger.info("[PIPELINE][GENERATE][fallback_used] mode=heuristic")
         q_terms = [t.lower() for t in question.split() if len(t) > 3][:8]
         sentences: List[str] = []
         for c in context_chunks:
@@ -97,7 +121,7 @@ async def generate_answer(question: str, context_chunks: List[Dict]):
             "sources": [f"page:{c['page']}" for c in context_chunks],
             "latency_ms": int((time.time() - start) * 1000),
             "retrieved": len(context_chunks),
-            "generation_mode": "fallback",
+            "generation_mode": "fallback-heuristic",
             "fallback_reason": f"{e}"[:160],
             "tried_models": tried_models,
         }

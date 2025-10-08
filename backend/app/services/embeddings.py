@@ -7,6 +7,7 @@ import hashlib
 import math
 import asyncio
 from loguru import logger
+from app.services import local_models
 
 
 class EmbeddingList(list):
@@ -37,6 +38,18 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
         return [x / norm for x in vec]
 
     if not runtime_key:
+        if getattr(settings, 'pipeline_debug', False):
+            logger.info("[PIPELINE][EMBED][select] no_api_key=True attempting=local-sbert->hash")
+        # Try local sentence-transformers first
+        local_vecs = local_models.local_embed(texts) if settings.enable_local_embedding_fallback else None
+        if local_vecs:
+            vectors: EmbeddingList = EmbeddingList(local_vecs)
+            setattr(vectors, "_embed_mode", "local-sbert")
+            if getattr(settings, 'pipeline_debug', False):
+                logger.info(f"[PIPELINE][EMBED] mode=local-sbert batch={len(texts)} dim={len(vectors[0]) if vectors else 0}")
+            return vectors
+        if getattr(settings, 'pipeline_debug', False):
+            logger.info("[PIPELINE][EMBED][fallback] local-sbert-unavailable using=hash")
         vectors: EmbeddingList = EmbeddingList([hash_embed(t) for t in texts])
         setattr(vectors, "_embed_mode", "hash")
         if getattr(settings, 'pipeline_debug', False):
@@ -82,6 +95,8 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
             if not success:
                 out.append(hash_embed(t))
                 used_hash = True
+                if getattr(settings, 'pipeline_debug', False):
+                    logger.info("[PIPELINE][EMBED][chunk_fallback] mode=hash reason=gemini_failed")
             if delay_ms and success:
                 await asyncio.sleep(delay_ms / 1000.0)
     setattr(out, "_embed_mode", "mixed" if used_hash else "gemini")

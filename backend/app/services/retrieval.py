@@ -149,6 +149,8 @@ async def search(query: str, top_k: Optional[int] = None, document_ids: Optional
     query_embed_mode = getattr(qvecs, "_embed_mode", "unknown")
     if getattr(settings, 'pipeline_debug', False):
         logger.info(f"[PIPELINE][RETRIEVE][embed_query] query='{query[:80]}' mode={query_embed_mode} dim={len(qvec)}")
+        if query_embed_mode != 'gemini':
+            logger.info(f"[PIPELINE][RETRIEVE][embed_query][note] non_gemini_mode={query_embed_mode} reason=likely_key_missing_or_chunk_fallback")
     vector_results = _memory_only_search(qvec, top_k, document_ids)
     for r in vector_results:
         r["_embed_mode"] = query_embed_mode
