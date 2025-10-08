@@ -6,6 +6,7 @@ import { ChatContainer } from './components/ChatContainer';
 import { ChatInput } from './components/ChatInput';
 import { DocumentSidebar } from './components/DocumentSidebar';
 import { FileDropzone } from './components/FileDropzone';
+import { CenterLoader } from './components/CenterLoader';
 
 interface Message { role: 'user' | 'assistant'; content: string; sources?: string[]; answer_type?: string; document_ids_used?: number[]; error?: boolean; }
 interface DocumentItem { id: number; filename: string; status: string; }
@@ -17,7 +18,7 @@ export default function HomeUnified() {
 	const [documents, setDocuments] = useState<DocumentItem[]>([]);
 	const [selectedDocs, setSelectedDocs] = useState<number[]>([]);
 	const [loadingSummary, setLoadingSummary] = useState(false);
-	const [streaming, setStreaming] = useState(false);
+	const [loadingAnswer, setLoadingAnswer] = useState(false);
 	const { push } = useToasts();
 	const [uploading, setUploading] = useState(false);
 	const [deleting, setDeleting] = useState<number|null>(null);
@@ -27,6 +28,8 @@ export default function HomeUnified() {
 	const [ingesting, setIngesting] = useState(false);
 	const [diagnostics, setDiagnostics] = useState<any|null>(null);
 	const [geminiStatus, setGeminiStatus] = useState<{active:boolean; last_error?:string|null}>({active:false});
+	const [enterStreams,setEnterStreams]=useState(true);
+	const [resetting,setResetting]=useState(false);
 	const backend = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
 	const bottomRef = useRef<HTMLDivElement | null>(null);
 
@@ -45,22 +48,12 @@ export default function HomeUnified() {
 	const ask = async (qOverride?:string) => {
 		const q = (qOverride ?? question).trim(); if(!q) return;
 		if(ingesting){ push({message:'Please wait - documents still processing', type:'info'}); return; }
-		setMessages(m=>[...m,{role:'user',content:q}]); if(!qOverride) setQuestion('');
+		setMessages(m=>[...m,{role:'user',content:q}]); if(!qOverride) setQuestion(''); setLoadingAnswer(true);
 		try { const res = await axios.post(`${backend}/ask`, {question:q, document_ids: selectedDocs.length? selectedDocs: undefined});
 			setMessages(m=>[...m,{role:'assistant', content: res.data.answer, sources: res.data.sources, answer_type: res.data.answer_type, document_ids_used: res.data.document_ids_used, embed_mode: res.data.embed_mode, generation_mode: res.data.generation_mode}]);
 			setActiveAnswerDocs(res.data.document_ids_used||[]);
 		} catch { push({message:'Ask failed', type:'error'}); setMessages(m=>[...m,{role:'assistant',content:'Error: unable to get answer.',answer_type:'out_of_scope'}]); }
-	};
-
-	const askStream = async (qOverride?:string) => {
-		const q = (qOverride ?? question).trim(); if(!q) return;
-		if(ingesting){ push({message:'Please wait - documents still processing', type:'info'}); return; }
-		setMessages(m=>[...m,{role:'user',content:q}]); if(!qOverride) setQuestion('');
-		const body = JSON.stringify({question:q, document_ids: selectedDocs.length? selectedDocs: undefined});
-		let reader:ReadableStreamDefaultReader<Uint8Array>|undefined;
-		try { setStreaming(true); const resp = await fetch(`${backend}/ask/stream`, {method:'POST', headers:{'Content-Type':'application/json'}, body}); reader = resp.body?.getReader(); const decoder = new TextDecoder(); let partial='';
-			while(reader){ const {done,value} = await reader.read(); if(done) break; const txt = decoder.decode(value); txt.split('\n\n').forEach(block=>{ if(!block.startsWith('data:')) return; const jsonPart = block.replace(/^data:\s*/,''); try { const obj = JSON.parse(jsonPart); if(obj.partial){ partial=obj.partial; setMessages(m=>{ const filtered = m.filter(x=>!(x as any)._streamingTemp); return [...filtered,{role:'assistant',content:partial,answer_type:'stream', _streamingTemp:true} as any]; }); } else if(obj.answer){ setMessages(m=>[...m.filter(x=>!(x as any)._streamingTemp), {role:'assistant', content:obj.answer, sources:obj.sources, answer_type: obj.answer_type, document_ids_used: obj.document_ids_used}]); setActiveAnswerDocs(obj.document_ids_used||[]); } } catch{} }); }
-		} catch { push({message:'Stream failed', type:'error'}); } finally { setStreaming(false); }
+		finally { setLoadingAnswer(false); }
 	};
 
 	const summarize = async () => { if(selectedDocs.length!==1) return alert('Select exactly one document'); const id=selectedDocs[0]; const doc = documents.find(d=>d.id===id); if(!doc || doc.status!=='ingested'){ push({message:'Document still ingesting', type:'info'}); return; } setLoadingSummary(true); try { const res = await axios.get(`${backend}/summarize/${id}`); setMessages(m=>[...m,{role:'assistant',content:res.data.answer,sources:res.data.sources,answer_type:res.data.answer_type}]); } finally { setLoadingSummary(false); } };
@@ -71,6 +64,25 @@ export default function HomeUnified() {
 	useEffect(()=>{ const iv = setInterval(async ()=>{ for(const [docId, taskId] of Object.entries(pendingTasks)){ try { const r = await axios.get(`${backend}/tasks/${taskId}`); const st = r.data?.status; if(st && st!=='PENDING' && st!=='STARTED'){ refreshDocuments(); setPendingTasks(p=>{ const cp={...p}; delete cp[Number(docId)]; return cp; }); } } catch {} } }, 3000); return ()=>clearInterval(iv); },[pendingTasks]);
 
 	const deleteDoc = async (id:number) => { if(!confirm('Delete this document?')) return; try { await axios.delete(`${backend}/documents/${id}`); push({message:'Deleted', type:'info'}); } catch { push({message:'Delete failed', type:'error'});} finally { refreshDocuments(); } };
+
+	const resetAll = async () => {
+		if(!confirm('This will clear documents, vectors, uploads and runtime key. Continue?')) return;
+		setResetting(true);
+		try {
+			const resp = await axios.post(`${backend}/admin/reset?token=${encodeURIComponent('')}`);
+			const ok = resp.data?.success;
+			const stats = resp.data?.retrieval_stats;
+			setMessages([]); setSelectedDocs([]); setActiveAnswerDocs([]);
+			if(ok && stats?.vectors===0 && stats?.lexical_chunks===0){
+				push({message:'Pipeline fully reset', type:'success'});
+			}else{
+				push({message:'Reset partial - check backend logs', type:'info'});
+			}
+			refreshDocuments(); refreshDiagnostics();
+		}
+		catch { push({message:'Reset failed', type:'error'}); }
+		finally { setResetting(false); }
+	};
 
 	const STAGE_LABEL: Record<string,string> = { downloading:'Downloading', parsing:'Parsing', chunking:'Chunking', embedding:'Embedding', indexing:'Indexing', uploaded:'Queued', ingested:'Ready', error:'Error' };
 	const docChip = (d:DocumentItem) => { const used = activeAnswerDocs.includes(d.id); const pending = pendingTasks[d.id]; const processing = !['ingested','error'].includes(d.status); const color = d.status==='ingested'?'bg-green-500': d.status==='error'? 'bg-red-500': 'bg-amber-500'; return (
@@ -86,10 +98,11 @@ export default function HomeUnified() {
 	useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
 
 	return (
-		<main className="h-[calc(100vh-3.5rem)] max-w-full flex flex-col md:flex-row">
+		<main className="relative h-[calc(100vh-3.5rem)] max-w-full flex flex-col md:flex-row">
 			<div className="w-full md:w-72 border-b md:border-b-0 md:border-r bg-white dark:bg-gray-900 flex flex-col">
 				<div className="p-3 space-y-3">
 					<FileDropzone onFiles={handleFiles} />
+					<button onClick={resetAll} disabled={resetting} className="w-full text-[10px] px-2 py-1.5 rounded bg-red-600 text-white disabled:opacity-50 hover:bg-red-500">{resetting? 'Resetting…':'Reset / Clear All'}</button>
 					<div>
 						<label className="block text-[10px] font-semibold uppercase tracking-wide text-gray-500 mb-1">Pick Files</label>
 						<input type="file" multiple onChange={e=>{ if(e.target.files) handleFiles(e.target.files); }} className="text-xs" />
@@ -113,19 +126,20 @@ export default function HomeUnified() {
 					<span className="ml-auto flex items-center gap-2 text-gray-400">Ingested {documents.filter(d=>d.status==='ingested').length}/{documents.length}{ingesting && <span className="flex items-center gap-1 text-amber-500"><span className="w-2 h-2 rounded-full bg-amber-400 animate-ping"/>Processing</span>}</span>
 					{geminiStatus && <span className={`flex items-center gap-1 ${geminiStatus.active? 'text-indigo-600':'text-gray-400'}`} title={geminiStatus.last_error? `Last error: ${geminiStatus.last_error}`: geminiStatus.active? 'Gemini key active':'No Gemini key'}>⚡ {geminiStatus.active? 'Gemini':'No-Key'}{geminiStatus.last_error && <span className="text-red-500">!</span>}</span>}
 				</div>
-				<ChatContainer messages={messages} streaming={streaming} />
+				<ChatContainer messages={messages} />
 				<div className="border-t p-4 bg-white dark:bg-gray-900">
-					<ChatInput onSend={(q)=>ask(q)} onStream={(q)=>askStream(q)} disabled={documents.length===0 || ingesting || selectedDocs.some(id=> documents.find(d=>d.id===id)?.status!=='ingested')} />
+					<ChatInput onSend={(q)=>ask(q)} disabled={documents.length===0 || ingesting || selectedDocs.some(id=> documents.find(d=>d.id===id)?.status!=='ingested')} />
 					<div className="mt-2 text-[11px] text-gray-500 flex gap-4 flex-wrap items-center">
 						<span>Selected: {selectedDocs.length || 'none'}</span>
 						<span>Answer uses: {activeAnswerDocs.length || '0'}</span>
-						{streaming && <span className="flex items-center gap-1 text-indigo-500"><span className="w-2 h-2 rounded-full bg-indigo-400 animate-ping"/>Streaming</span>}
-						{ingesting && !streaming && <span className="flex items-center gap-1 text-amber-500"><span className="w-2 h-2 rounded-full bg-amber-400 animate-ping"/>Ingesting…</span>}
+						{loadingAnswer && <span className="flex items-center gap-1 text-indigo-500"><span className="w-2 h-2 rounded-full bg-indigo-400 animate-ping"/>Loading answer…</span>}
+						{ingesting && !loadingAnswer && <span className="flex items-center gap-1 text-amber-500"><span className="w-2 h-2 rounded-full bg-amber-400 animate-ping"/>Ingesting…</span>}
 						{health && <span className={`flex items-center gap-1 ${health.status==='ok'?'text-green-600':'text-red-500'}`} title={Object.entries(health.components).map(([k,v])=>`${k}:${v}`).join('\n')}>● {health.status}</span>}
 						<span className="hidden sm:inline ml-auto">Tip: Shift+Enter for newline</span>
 					</div>
 				</div>
 			</div>
+		<CenterLoader visible={loadingAnswer} />
 		</main>
 	);
 }

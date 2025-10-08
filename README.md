@@ -14,6 +14,7 @@ Lightweight Retrieval Augmented Generation Q&A with minimal dependencies:
 * Upload PDF / DOCX / TXT
 * Parse → chunk → embed → index inline
 * Hybrid semantic + lexical retrieval
+* Embedded in-memory Qdrant vector index (no external service daemon, replaces prior HNSW path)
 * Summarization
 * Ephemeral runtime Gemini key
 
@@ -107,8 +108,9 @@ Set `GEMINI_API_KEY` in `.env` or POST `/gemini/key` with `{ "key": "..." }` (ep
 | Mode | Setting | Persists | Use When |
 |------|---------|----------|----------|
 | Memory | `USE_IN_MEMORY=true` | Nothing | Quick demo / single doc |
+| Memory + Embedded Qdrant | `USE_IN_MEMORY=true` + `USE_QDRANT_EMBEDDED=true` | Nothing | Multi-doc vector search |
 | SQLite | `USE_IN_MEMORY=false` | Docs + status + text | Need restart survival |
-| Qdrant (optional) | `QDRANT_URL` | Vectors externally | Larger corpora |
+| External Qdrant | `QDRANT_URL` | Vectors externally | Larger corpora |
 
 ## Core Endpoints
 `POST /upload` – upload & ingest
@@ -121,6 +123,9 @@ Set `GEMINI_API_KEY` in `.env` or POST `/gemini/key` with `{ "key": "..." }` (ep
 `GET /health` – component status
 `GET /diagnostics` – ingestion + Gemini stats
 `POST /admin/reset?token=...` – clear all state
+
+## Processing Flow
+FastAPI → Parse (PyMuPDF / python-docx) → RecursiveCharacterTextSplitter → Gemini Embeddings → Embedded Qdrant (in-memory) → Question Embedding → Qdrant Retrieval → Gemini Generation (fallback if needed)
 
 ## Admin Reset
 ```
@@ -138,3 +143,41 @@ Optional re-introduction scripts for container builds (if needed), reranking, ci
 
 ## License
 MIT
+
+
+
+
+
+
+
+
+# Go to repo root
+cd ~/Downloads/CodeBase/ChatWithDoc
+
+# (Optional) Clean any old venv
+rm -rf backend/.venv
+
+# Create & activate virtual env
+python3 -m venv backend/.venv
+source backend/.venv/bin/activate
+
+# Upgrade pip
+pip install --upgrade pip
+
+# Install dependencies
+pip install -r backend/requirements.txt
+
+
+
+brew install tesseract
+
+cd backend
+source .venv/bin/activate  # if not already active
+python run_local.py        # hot reload enabled (uses uvicorn programmatically)
+
+uvicorn app.main:app --reload --port 8000
+
+
+cd ~/Downloads/CodeBase/ChatWithDoc
+source backend/.venv/bin/activate
+uvicorn backend.app.main:app --reload --port 8000

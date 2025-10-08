@@ -47,12 +47,12 @@ async def health():
             components["db"] = "ok"
         except Exception as e:  # pragma: no cover
             components["db"] = f"error: {e}"
-    if settings.qdrant_url:
+    if getattr(settings, 'use_qdrant_embedded', False):
         try:
             retrieval.ensure_collection()
-            components["qdrant"] = "ok"
+            components["qdrant_embedded"] = "ok"
         except Exception as e:
-            components["qdrant"] = f"error: {e}"
+            components["qdrant_embedded"] = f"error: {e}"
     overall = "ok" if all(v in ("ok", "in_memory") for v in components.values()) else "degraded"
     return {"status": overall, "components": components}
 
@@ -216,6 +216,8 @@ async def list_documents(db: AsyncSession = Depends(get_db)):
 @router.post("/ask", response_model=Answer)
 async def ask(req: AskRequest):
     start = time.time()
+    if settings.pipeline_debug:
+        logger.info(f"[PIPELINE][ASK][start] question='{req.question[:120]}' docs_filter={req.document_ids}")
     try:
         results = await retrieval.search(req.question, settings.top_k, document_ids=req.document_ids)
     except Exception as e:  # broad catch to prevent 500 surface
@@ -234,6 +236,35 @@ async def ask(req: AskRequest):
     # If threshold filtered everything but we had candidates, take the top-1 so user gets best-effort answer.
     if not filtered and results:
         filtered = results[:1]
+    # Adaptive broad-question enrichment: if user asks a summarization/broad intent question and we have too few chunks, broaden context.
+    broad_q = req.question.lower().strip().rstrip('?')
+    BROAD_PATTERNS = [
+        'what is this document about',
+        'what is the document about',
+        'summarize this document',
+        'give me a summary',
+        'overall summary',
+        'summary of the document'
+    ]
+    if len(filtered) < 2 and results and any(p in broad_q for p in BROAD_PATTERNS):
+        # Take top up to 3 distinct chunks even if below threshold (context amplification)
+        enriched = results[: min(3, len(results))]
+        if settings.pipeline_debug:
+            logger.info(f"[PIPELINE][ASK][adaptive_enrich] broad_intent=True original_filtered={len(filtered)} enriched_to={len(enriched)}")
+        filtered = enriched
+    if settings.pipeline_debug:
+        logger.info(f"[PIPELINE][ASK][retrieved] total_candidates={len(results)} used={len(filtered)} threshold={settings.similarity_threshold}")
+        # Log acceptance / rejection rationale for each candidate (top candidates list only)
+        for idx, cand in enumerate(results):
+            if idx >= settings.top_k:
+                break
+            hs = cand.get('hybrid_score', cand.get('score',0))
+            accepted = hs >= settings.similarity_threshold or cand in filtered
+            reason = 'below_threshold' if hs < settings.similarity_threshold else 'meets_threshold'
+            if accepted and cand in results[:1] and len(filtered)==1 and hs < settings.similarity_threshold:
+                reason = 'fallback_top1'
+            snippet = (cand.get('text') or '').replace('\n',' ')[:160]
+            logger.info(f"[PIPELINE][ASK][candidate] rank={idx+1} hybrid={hs:.4f} mode={cand.get('mode')} accepted={accepted} reason={reason} doc={cand.get('document_id')} page={cand.get('page')} text='{snippet}'")
     if not filtered:
         return {
             "answer": "I'm sorry, that appears to be outside the scope of the provided documents or they are still ingesting.",
@@ -256,6 +287,8 @@ async def ask(req: AskRequest):
     answer["document_ids_used"] = list({c.get("document_id") for c in filtered if c.get("document_id") is not None})
     answer["latency_ms"] = int((time.time() - start) * 1000)
     answer.setdefault("retrieved", len(filtered))
+    if settings.pipeline_debug:
+        logger.info(f"[PIPELINE][ASK][done] retrieved={answer.get('retrieved')} latency_ms={answer.get('latency_ms')} generation_mode={answer.get('generation_mode')} embed_mode={answer.get('embed_mode')}")
     return answer
 
 
@@ -331,14 +364,9 @@ async def admin_reset(token: str):
     except Exception:
         pass
     # Redis purge skipped (redis removed)
-    # In-memory retrieval indexes
-    try:
-        from app.services import retrieval as rmod
-        rmod._MEM_INDEX.clear()  # type: ignore
-        rmod._LEX_CHUNKS.clear()  # type: ignore
-        rmod._LEX_TERM_FREQS.clear()  # type: ignore
-        rmod._LEX_DOC_FREQ.clear()  # type: ignore
-        rmod._LEX_TOTAL = 0  # type: ignore
-    except Exception:
-        pass
-    return {"status": "reset", "message": "All stores cleared"}
+    # Retrieval reset with verification
+    from app.services import retrieval as rmod
+    rmod.reset_all()
+    st = rmod.stats()
+    success = (st.get("vectors") == 0 and st.get("lexical_chunks") == 0 and ("qdrant_points" not in st or st.get("qdrant_points") == 0))
+    return {"status": "reset" if success else "partial", "message": "All stores cleared" if success else "Partial cleanup (some resources not cleared)", "retrieval_stats": st, "documents_remaining": (len(memdb.list_documents()) if settings.use_in_memory else None)}

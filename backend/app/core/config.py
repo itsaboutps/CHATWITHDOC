@@ -13,8 +13,8 @@ class Settings(BaseSettings):
     use_in_memory: bool = True
     database_url: str = "sqlite+aiosqlite:///./app.db"  # ignored when in-memory
 
-    # Optional future vector DB (Qdrant) – unused in pure local mode.
-    qdrant_url: str = ""
+    # Embedded Qdrant in-memory (optional). If use_qdrant_embedded=True we build an in-memory collection.
+    use_qdrant_embedded: bool = True
     qdrant_collection: str = "documents"
 
     minio_endpoint: str = ""
@@ -27,10 +27,13 @@ class Settings(BaseSettings):
     similarity_threshold: float = 0.55
     top_k: int = 5
     sync_ingest: bool = False
+    use_qdrant_embedded: bool = True  # embedded in-memory Qdrant is canonical vector store
     api_key: Optional[str] = None
     admin_reset_token: Optional[str] = None
 
     log_level: str = "INFO"
+    # Enable verbose pipeline stage logs (ingest + ask flow) when True
+    pipeline_debug: bool = True
 
     class Config:
         env_file = ".env"

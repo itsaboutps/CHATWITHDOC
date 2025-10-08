@@ -3,9 +3,9 @@ import { MessageBubble, MessageBubbleProps } from './MessageBubble';
 
 export interface ChatMessage extends MessageBubbleProps {}
 
-export function ChatContainer({ messages, streaming }: { messages:ChatMessage[]; streaming?:boolean }) {
+export function ChatContainer({ messages }: { messages:ChatMessage[] }) {
   const bottomRef = useRef<HTMLDivElement|null>(null);
-  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[messages, streaming]);
+  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
   return (
     <div className="flex-1 overflow-auto px-6 py-8 space-y-6 custom-scroll" id="chat-scroll">
       {messages.length===0 && (
@@ -14,12 +14,6 @@ export function ChatContainer({ messages, streaming }: { messages:ChatMessage[];
         </div>
       )}
   {messages.map((m,i)=>(<MessageBubble key={i} role={m.role} content={m.content} sources={m.sources} answer_type={m.answer_type} document_ids_used={m.document_ids_used} embed_mode={(m as any).embed_mode} generation_mode={(m as any).generation_mode} />))}
-      {streaming && (
-        <div className="flex items-center gap-2 text-xs text-gray-500 animate-pulse pl-2">
-          <span className="w-2 h-2 rounded-full bg-indigo-400 animate-ping"></span>
-          Generating answer…
-        </div>
-      )}
       <div ref={bottomRef} />
     </div>
   );

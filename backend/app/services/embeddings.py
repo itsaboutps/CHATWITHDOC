@@ -39,6 +39,8 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
     if not runtime_key:
         vectors: EmbeddingList = EmbeddingList([hash_embed(t) for t in texts])
         setattr(vectors, "_embed_mode", "hash")
+        if getattr(settings, 'pipeline_debug', False):
+            logger.info(f"[PIPELINE][EMBED] mode=hash batch={len(texts)} dim={len(vectors[0]) if vectors else 0}")
         return vectors
 
     raw_model = settings.embedding_model or "embedding-001"
@@ -83,4 +85,6 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
             if delay_ms and success:
                 await asyncio.sleep(delay_ms / 1000.0)
     setattr(out, "_embed_mode", "mixed" if used_hash else "gemini")
+    if getattr(settings, 'pipeline_debug', False):
+        logger.info(f"[PIPELINE][EMBED] mode={'mixed' if used_hash else 'gemini'} batch={len(texts)} dim={len(out[0]) if out else 0}")
     return out

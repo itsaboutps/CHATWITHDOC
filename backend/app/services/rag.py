@@ -24,6 +24,8 @@ Context:
 
 async def generate_answer(question: str, context_chunks: List[Dict]):
     start = time.time()
+    if getattr(settings, 'pipeline_debug', False):
+        logger.info(f"[PIPELINE][GENERATE][start] question='{question[:120]}' ctx_chunks={len(context_chunks)}")
     if not context_chunks:
         return {
             "answer": "I'm sorry, that appears to be outside the scope of the provided documents.",
@@ -56,15 +58,21 @@ async def generate_answer(question: str, context_chunks: List[Dict]):
                 r = await client.post(url, json=payload)
                 if r.status_code == 404:
                     logger.warning(f"Generation 404 for model {cand}; trying next candidate if any")
+                    if getattr(settings, 'pipeline_debug', False):
+                        logger.info(f"[PIPELINE][GENERATE][model_404] model={cand}")
                     continue
                 r.raise_for_status()
                 data = r.json()
                 runtime_state.set_gemini_success()
+                if getattr(settings, 'pipeline_debug', False):
+                    logger.info(f"[PIPELINE][GENERATE][model_ok] model={cand} retrieved={len(context_chunks)}")
                 break
         except Exception as e:  # store and keep trying
             error_obj = e
             runtime_state.set_gemini_failure(f"gen_error: {e}")
             logger.warning(f"Generation attempt failed for {cand}: {e}")
+            if getattr(settings, 'pipeline_debug', False):
+                logger.error(f"[PIPELINE][GENERATE][model_error] model={cand} error={e}")
             continue
     if data is None:
         e = error_obj or Exception("All generation attempts failed")
@@ -111,6 +119,8 @@ async def generate_answer(question: str, context_chunks: List[Dict]):
     parsed["generation_mode"] = "gemini"
     parsed.setdefault("model_used", tried_models[-1] if tried_models else settings.generation_model)
     parsed.setdefault("fallback_reason", None)
+    if getattr(settings, 'pipeline_debug', False):
+        logger.info(f"[PIPELINE][GENERATE][done] model={parsed.get('model_used')} latency_ms={parsed.get('latency_ms')} retrieved={parsed.get('retrieved')} answer_type={parsed.get('answer_type')}")
     return parsed
 
 SUMMARY_PROMPT = """You are a summarization assistant. Produce a concise, comprehensive summary of the document content below. Return JSON with keys: answer (the summary), answer_type='summarization', sources (list of page numbers referenced).\n\nContent:\n{content}\n"""

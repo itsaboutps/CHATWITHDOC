@@ -22,3 +22,5 @@ pytest==8.3.2
 pytest-asyncio==0.23.8
 requests==2.32.3
 loguru==0.7.2
+qdrant-client==1.9.2
+qdrant-client==1.9.2
