@@ -181,3 +181,9 @@ uvicorn app.main:app --reload --port 8000
 cd ~/Downloads/CodeBase/ChatWithDoc
 source backend/.venv/bin/activate
 uvicorn backend.app.main:app --reload --port 8000
+
+
+
+text-embedding-004 
+gemini-2.5-flash
+AIzaSyC0_UWujD0SSGDIejLNUosbTcd3fuBM8Zo
