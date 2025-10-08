@@ -1,0 +1,90 @@
+# Python venvs
+.venv/
+.venv_local/
+.venv_clean/
+.venv_e2e/
+.venv.corrupt.1759935187/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pytest_cache/
+*.mypy_cache/
+
+# Env files
+.env
+.env.local
+.env.*.local
+
+# OS / Editor
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.idea/
+.vscode/
+
+# Build / Dist
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# Coverage / Reports
+htmlcov/
+.coverage*
+.pytest_cache/
+
+# Local data uploads
+/data/uploads/
+app.db
+*.sqlite3
+
+# Logs
+*.log
+logs/
+log/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+
+# Python tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+*.prof
+.python-version
+
+# Node (frontend if present)
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/.vercel/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Docker / compose artifacts (if any left)
+*.pid
+
+# Misc
+*.swp
+*.swo
+*.patch
+*.diff
+~$*
+*.crdownload
+*.DS_Store
+
+# Local data (redundant safety)
+data/uploads/**

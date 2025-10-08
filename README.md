@@ -1,131 +1,140 @@
-# Document Q&A RAG System
+# Document Q&A RAG System (Simplified No-Infra Mode)
+# Document Q&A RAG System (Ultra Simplified Local Mode)
 
-End-to-end Retrieval Augmented Generation document Q&A system with FastAPI backend, Next.js frontend, Qdrant vector DB, Postgres metadata DB, MinIO object storage, Redis/Celery ingestion workers, and Gemini API for embeddings + generation.
+Lightweight Retrieval Augmented Generation Q&A with minimal dependencies:
+* FastAPI backend
+* Next.js frontend (optional)
+* Optional Qdrant (otherwise in‑memory + lexical TF‑IDF)
+* In‑memory (default) or SQLite persistence (Postgres removed)
+* Local filesystem storage (MinIO removed)
+* Inline ingestion (Redis/Celery removed)
+* Gemini models (hash fallback offline embeddings)
 
 ## Features
-- Upload PDF/DOCX/TXT (OCR for scanned PDFs)
-- Async ingestion (parsing -> chunking -> embeddings -> vector store)
-- RAG question answering with answer classification & out-of-scope detection
-- Chat UI with source display
+* Upload PDF / DOCX / TXT
+* Parse → chunk → embed → index inline
+* Hybrid semantic + lexical retrieval
+* Summarization
+* Ephemeral runtime Gemini key
 
-## Quick Start
-
-1. Copy environment file:
+## Quick Start (No Docker – Docker artifacts removed)
 ```bash
 cp .env.example .env
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r backend/requirements.txt
+python backend/run_local.py
 ```
-2. (Optional) Set `GEMINI_API_KEY` OR leave it blank and enter the key in the Chat UI (ephemeral, not persisted). If left blank and no UI key, system uses offline deterministic hash embeddings (lower semantic quality but functional).
-3. Launch stack:
+Frontend (optional):
 ```bash
-docker compose up --build
+cd frontend
+npm install
+npm run dev
 ```
-4. Open frontend (single-page workspace): http://localhost:3000
-	All actions (upload, delete, select docs, summarize, ask, stream answers, set Gemini key) happen on the landing page.
-5. (Optional) Run migrations (if using Postgres & Alembic):
+Open http://localhost:3000
+
+### Full Stack (Backend + Frontend) Concurrent Dev
+In one shell (backend):
 ```bash
-make migrate
+source .venv/bin/activate
+python backend/run_local.py
 ```
-
-If embedding dimension mismatches (Gemini may change), adjust `vector_size` in `app/services/retrieval.py` inside `ensure_collection`.
-
-### Gemini Key via UI
-You can omit `GEMINI_API_KEY` in `.env`. On the top navbar, enter your Gemini key and click "Set". The key:
-* Lives only in process memory (not saved to disk or DB)
-* Is propagated to ingestion workers at upload time so document embeddings use the same key
-* Clearing the key reverts to offline hash embedding mode
-
-### Hybrid Retrieval
-Vector similarity blended with TF-IDF (or naive keyword fallback). Blending logic lives in `retrieval.search`; adjust weight parameter there.
-
-### API Key Auth
-Set `API_KEY` in `.env` and send `x-api-key: <value>` header for protected endpoints. (Currently disabled in examples for faster local iteration.)
-
-### JWT Auth (Multi-User)
-Endpoints: `/auth/register`, `/auth/login` returning Bearer token. Include `Authorization: Bearer <token>` to scope documents per user.
-
-### Alembic Migrations
-Apply latest:
+In another shell (frontend):
 ```bash
-make migrate
+cd frontend
+echo "NEXT_PUBLIC_BACKEND_URL=http://localhost:8000" > .env.local
+npm install   # first time only
+npm run dev
 ```
-Create new after model change:
+Then browse: http://localhost:3000
+
+If port 8000 is busy, start backend on 8010:
 ```bash
-make revision
-make migrate
+uvicorn app.main:app --host 127.0.0.1 --port 8010 --reload
 ```
+and set `NEXT_PUBLIC_BACKEND_URL=http://localhost:8010`.
 
-### Evaluation
-Run sample evaluation:
+Optional helper (create a single script):
+## One-Step Scripts (added)
+* Unix/macOS: `./dev_all.sh` (creates venv, installs deps, launches backend + frontend; Ctrl+C stops)
+* Windows: `dev_all.bat` (opens backend in new window, runs frontend in current)
+
+Override ports:
 ```bash
-make eval
+BACKEND_PORT=8010 FRONTEND_PORT=3100 ./dev_all.sh
 ```
-Outputs `backend/eval_results.json`.
-
-### Bulk Upload Script
-Inside backend container (example):
+Check configuration without starting:
 ```bash
-docker compose exec backend python -m scripts.bulk_upload --dir /data/docs --email tester@example.com --password Test123 --concurrency 4
+./dev_all.sh check
+dev_all.bat check
 ```
-Match host directory by bind-mounting or copying docs into the container. Use `--pattern` to filter extensions.
+```bash
+cat > dev_all.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+BACKEND_PORT=${BACKEND_PORT:-8000}
+if [ ! -d .venv ]; then python3 -m venv .venv; fi
+source .venv/bin/activate
+pip install -q -r backend/requirements.txt
+(
+	cd backend
+	uvicorn app.main:app --host 127.0.0.1 --port $BACKEND_PORT --reload &
+	BPID=$!
+	echo "Backend PID: $BPID"
+)
+(
+	cd frontend
+	echo "NEXT_PUBLIC_BACKEND_URL=http://localhost:$BACKEND_PORT" > .env.local
+	[ -d node_modules ] || npm install
+	npm run dev
+)
+EOF
+chmod +x dev_all.sh
+./dev_all.sh
+```
 
-### Streaming
-`POST /ask/stream` returns SSE events with incremental `partial` payloads then final answer.
+Default is memory only. For SQLite persistence edit `.env`:
+```
+USE_IN_MEMORY=false
+DATABASE_URL=sqlite+aiosqlite:///./app.db
+```
 
-### Source Snippets
-Field `source_snippets` (list) returned in `/ask` for showing context previews in UI.
+## Gemini Key
+Set `GEMINI_API_KEY` in `.env` or POST `/gemini/key` with `{ "key": "..." }` (ephemeral in-process).
 
-## API (Backend)
-The UI calls these endpoints behind the single-page interface:
-- `POST /upload` — multipart file upload
-- `GET /documents` — list documents + status
-- `POST /ask` — answer a question (optionally filter with `document_ids`)
-- `POST /ask/stream` — Server-Sent Events streaming answers
-- `GET /tasks/{task_id}` — ingestion Celery task status
-- `GET /health` — component health snapshot
-- `GET /summarize/{document_id}` — summarize an ingested document
-- `DELETE /documents/{document_id}` — remove document + vectors + object storage asset
-- `POST /gemini/key` / `GET /gemini/key` / `DELETE /gemini/key` — manage ephemeral Gemini key
-- `POST /admin/reset?token=...` — wipe DB, Qdrant collection, MinIO objects (Redis removed) (requires `ADMIN_RESET_TOKEN`)
+## Persistence Modes
+| Mode | Setting | Persists | Use When |
+|------|---------|----------|----------|
+| Memory | `USE_IN_MEMORY=true` | Nothing | Quick demo / single doc |
+| SQLite | `USE_IN_MEMORY=false` | Docs + status + text | Need restart survival |
+| Qdrant (optional) | `QDRANT_URL` | Vectors externally | Larger corpora |
+
+## Core Endpoints
+`POST /upload` – upload & ingest
+`GET /documents` – list docs
+`POST /ask` – question answering
+`GET /summarize/{id}` – summarization
+`DELETE /documents/{id}` – remove doc
+`POST /gemini/key` / `GET /gemini/key` / `DELETE /gemini/key`
+`GET /gemini/models` + `POST /gemini/models/config`
+`GET /health` – component status
+`GET /diagnostics` – ingestion + Gemini stats
+`POST /admin/reset?token=...` – clear all state
+
+## Admin Reset
+```
+curl -X POST "http://localhost:8000/admin/reset?token=YOUR_TOKEN"
+```
+Clears: runtime key, SQLite tables (if used), Qdrant collection, local files, in‑memory indexes.
 
 ## Tests
-Inside backend container:
 ```bash
 pytest -q
 ```
 
-### Admin Reset
-Set `ADMIN_RESET_TOKEN` in `.env` (e.g. `ADMIN_RESET_TOKEN=devreset123`). Then:
-```
-curl -X POST "http://localhost:8000/admin/reset?token=devreset123"
-```
-This clears: runtime key, tables, Qdrant collection, MinIO objects, in-memory indices.
-
-## Roadmap Improvements
-- Advanced reranking (e.g., Cohere/ColBERT) and MMR diversification
-- Fine-grained citation spans & color-coded highlights
-- Per-user storage quotas & lifecycle management
-- Doc versioning & re-index diffing
-- Batch evaluation & regression dashboards
-- Observability (OpenTelemetry traces + structured logs)
-- Prompt caching & answer reuse
-- RBAC / organization teams
+## Roadmap (Future)
+Optional re-introduction scripts for container builds (if needed), reranking, citation spans, versioning, evaluation harness, observability, prompt caching, RBAC.
 
 ## License
 MIT
-
-
-
-
-
-docker compose logs --tail=60 backend
-docker compose down
-Simplified stack (Celery/Redis removed). Run:
-
-```bash
-docker compose down --remove-orphans
-docker compose up -d --build backend frontend qdrant postgres minio
-docker compose logs --tail=60 backend
-```
-
-
-# CHATWITHDOC

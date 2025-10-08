@@ -1,14 +1,13 @@
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
 from app.core.config import get_settings
 from .embeddings import embed_texts
 from typing import List, Dict, Optional
-from loguru import logger
-import math, re, collections
+import logging, math, re, collections
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
-client = QdrantClient(url=settings.qdrant_url)
+client = None  # Qdrant disabled in simplified mode
 
 # In-memory fallback store (vector)
 _MEM_INDEX: List[Dict] = []  # {vector, text, page, document_id}
@@ -74,22 +73,8 @@ def _lex_search(query: str, top_k: int, document_ids: Optional[List[int]]):
     return out
 
 
-def ensure_collection(vector_size: int | None = None):
-    try:
-        existing = {c.name: c for c in client.get_collections().collections}
-    except Exception:
-        # Qdrant not available yet
-        return
-    if settings.qdrant_collection in existing:
-        return
-    if vector_size is None:
-        # Defer creation until we know vector size (first add_documents or search call)
-        logger.debug("Deferring collection creation until vector size known")
-        return
-    client.recreate_collection(
-        collection_name=settings.qdrant_collection,
-        vectors_config=qmodels.VectorParams(size=vector_size, distance=qmodels.Distance.COSINE),
-    )
+def ensure_collection(vector_size: Optional[int] = None):
+    return  # no-op
 
 
 async def add_documents(chunks: List[Dict]):
@@ -103,10 +88,7 @@ async def add_documents(chunks: List[Dict]):
         return
     # Ensure collection with actual size
     ensure_collection(len(vectors[0]))
-    points = []
     for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
-        # Qdrant PointStruct requires an id (int or UUID). Use a simple incremental integer.
-        points.append(qmodels.PointStruct(id=idx, vector=vec, payload={**chunk}))
         _MEM_INDEX.append({
             "vector": vec,
             "text": chunk.get("text"),
@@ -114,10 +96,6 @@ async def add_documents(chunks: List[Dict]):
             "document_id": chunk.get("document_id"),
             "_embed_mode": embed_mode
         })
-    try:
-        client.upsert(collection_name=settings.qdrant_collection, points=points)
-    except Exception:
-        logger.warning("Vector upsert skipped (Qdrant unreachable)")
     # lexical index update
     try:
         _lex_add(chunks)
@@ -125,40 +103,14 @@ async def add_documents(chunks: List[Dict]):
         pass
 
 
-async def search(query: str, top_k: int | None = None, document_ids: Optional[List[int]] = None, hybrid_weight: float = 0.4):
+async def search(query: str, top_k: Optional[int] = None, document_ids: Optional[List[int]] = None, hybrid_weight: float = 0.4):
     top_k = top_k or settings.top_k
     qvecs = await embed_texts([query])
     qvec = qvecs[0]
     query_embed_mode = getattr(qvecs, "_embed_mode", "unknown")
-    ensure_collection(len(qvec))
-    search_filter = None
-    if document_ids:
-        try:
-            search_filter = qmodels.Filter(
-                must=[qmodels.FieldCondition(key="document_id", match=qmodels.MatchAny(any=document_ids))]
-            )
-        except Exception:  # pragma: no cover
-            search_filter = None
-    try:
-        res = client.search(
-            collection_name=settings.qdrant_collection,
-            query_vector=qvec,
-            limit=top_k,
-            query_filter=search_filter,
-        )
-    except Exception:
-        return _memory_only_search(qvec, top_k, document_ids)
-    vector_results = []
-    for r in res:
-        payload = r.payload or {}
-        vector_results.append({
-            "score": r.score,
-            "text": payload.get("text"),
-            "page": payload.get("page", 0),
-            "document_id": payload.get("document_id"),
-            "mode": "vector",
-            "_embed_mode": query_embed_mode
-        })
+    vector_results = _memory_only_search(qvec, top_k, document_ids)
+    for r in vector_results:
+        r["_embed_mode"] = query_embed_mode
     # Keyword layer (internal)
     keyword_results = _lex_search(query, top_k, document_ids)
     def normalize(items):
@@ -166,7 +118,12 @@ async def search(query: str, top_k: int | None = None, document_ids: Optional[Li
             return
         scs = [i["score"] for i in items]
         mn, mx = min(scs), max(scs)
-        rng = (mx - mn) or 1.0
+        if mx == mn:
+            # All equal scores: if non-zero give full weight so a solitary keyword/vector hit isn't discarded.
+            for i in items:
+                i["norm"] = 1.0 if i["score"] > 0 else 0.0
+            return
+        rng = mx - mn
         for i in items:
             i["norm"] = (i["score"] - mn) / rng
     normalize(vector_results)
@@ -191,15 +148,6 @@ async def search(query: str, top_k: int | None = None, document_ids: Optional[Li
     return final[:top_k]
 
 def delete_document_vectors(document_id: int):
-    try:
-        client.delete(
-            collection_name=settings.qdrant_collection,
-            points_selector=qmodels.FilterSelector(
-                filter=qmodels.Filter(must=[qmodels.FieldCondition(key="document_id", match=qmodels.MatchValue(value=document_id))])
-            ),
-        )
-    except Exception:
-        logger.warning(f"Failed to delete vectors for document {document_id} (Qdrant unreachable)")
     global _MEM_INDEX
     _MEM_INDEX = [c for c in _MEM_INDEX if c.get("document_id") != document_id]
 

@@ -1,21 +1,19 @@
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Header
+from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.db.session import get_db, engine, Base
 from app.db import models
+from app.services import memdb
 from app.schemas.base import UploadResponse, DocumentOut, AskRequest, Answer, HealthResponse
 from app.core.config import get_settings
-from app.core import runtime_state
-from app.services.storage import store_file
+from app.services.storage import store_file, delete_file
 from app.services import retrieval, rag
 from app.services.retrieval import delete_document_vectors
-from app.services.storage import _client as minio_client, settings as storage_settings
 from app.core import runtime_state as rt_state
-from app.core import runtime_state
 from app.services import embeddings as emb_mod
 from app.services import rag as rag_mod
-import time
-import io
+import time, io
 from app.utils.logging import setup_logging
 
 logger = setup_logging()
@@ -24,51 +22,38 @@ router = APIRouter()
 settings = get_settings()
 
 
-def require_api_key(x_api_key: str | None = Header(None)):
+def require_api_key(x_api_key: Optional[str] = Header(None)):
     if settings.api_key and x_api_key != settings.api_key:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 @router.on_event("startup")
 async def startup():
-    # Create tables
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    if not settings.use_in_memory:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
     retrieval.ensure_collection()
 
 
 @router.get("/health", response_model=HealthResponse)
 async def health():
     components: dict = {}
-    # Postgres
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(select(1))
-        components["postgres"] = "ok"
-    except Exception as e:  # pragma: no cover
-        components["postgres"] = f"error: {e}"  # noqa: E501
-    # Qdrant
-    try:
-        retrieval.ensure_collection()
-        components["qdrant"] = "ok"
-    except Exception as e:  # pragma: no cover
-        components["qdrant"] = f"error: {e}"
-    # MinIO
-    try:
-        from app.services.storage import _client, settings as s
-        # list_objects in minio-py doesn't accept max_keys param; fetch one safely
-        iterator = _client.list_objects(s.minio_bucket, recursive=False)
-        # Advance at most one item to validate access without loading everything
+    if settings.use_in_memory:
+        components["db"] = "in_memory"
+    else:
         try:
-            next(iterator, None)
-        except StopIteration:
-            pass
-        components["minio"] = "ok"
-    except Exception as e:  # pragma: no cover
-        components["minio"] = f"error: {e}"
-    # Redis removed in simplified mode
-    components["redis"] = "removed"
-    overall = "ok" if all(v in ("ok", "removed") for v in components.values()) else "degraded"
+            async with engine.begin() as conn:
+                await conn.execute(select(1))
+            components["db"] = "ok"
+        except Exception as e:  # pragma: no cover
+            components["db"] = f"error: {e}"
+    if settings.qdrant_url:
+        try:
+            retrieval.ensure_collection()
+            components["qdrant"] = "ok"
+        except Exception as e:
+            components["qdrant"] = f"error: {e}"
+    overall = "ok" if all(v in ("ok", "in_memory") for v in components.values()) else "degraded"
     return {"status": overall, "components": components}
 
 
@@ -77,19 +62,19 @@ async def set_gemini_key(payload: dict):  # payload expects {"key": "..."}
     key = payload.get("key", "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="Key required")
-    runtime_state.set_gemini_key(key)
+    rt_state.set_gemini_key(key)
     return {"status": "ok", "message": "Gemini key set (ephemeral)", "active": True}
 
 
 @router.delete("/gemini/key")
 async def clear_gemini_key():
-    runtime_state.clear_gemini_key()
+    rt_state.clear_gemini_key()
     return {"status": "ok", "message": "Gemini key cleared", "active": False}
 
 
 @router.get("/gemini/key")
 async def gemini_key_status():
-    return {"active": runtime_state.has_gemini_key()}
+    return {"active": rt_state.has_gemini_key()}
 
 
 @router.get("/gemini/models")
@@ -155,18 +140,27 @@ async def gemini_test_generate(q: str = "What is a test?", ctx: str = "A test ch
 
 @router.get("/diagnostics")
 async def diagnostics(db: AsyncSession = Depends(get_db)):
-    # Aggregate document ingestion states
-    res = await db.execute(select(models.Document.status, models.Document.id))
-    rows = res.fetchall()
-    total = len(rows)
-    by_status: dict[str,int] = {}
-    for st, _id in rows:  # type: ignore
-        by_status[st] = by_status.get(st, 0) + 1
-    gem = runtime_state.gemini_status()
+    if settings.use_in_memory:
+        docs = memdb.list_documents()
+        total = len(docs)
+        by_status = {}
+        for d in docs:
+            st = d.get("status", "unknown")
+            by_status[st] = by_status.get(st, 0) + 1
+        any_processing = any(st not in ("ingested", "error") for st in by_status.keys())
+    else:
+        res = await db.execute(select(models.Document.status, models.Document.id))
+        rows = res.fetchall()
+        total = len(rows)
+        by_status = {}
+        for st, _id in rows:  # type: ignore
+            by_status[st] = by_status.get(st, 0) + 1
+        any_processing = any(st not in ("ingested", "error") for st,_ in rows)
+    gem = rt_state.gemini_status()
     return {
         "documents_total": total,
         "documents_by_status": by_status,
-        "any_processing": any(st not in ("ingested", "error") for st,_ in rows),
+        "any_processing": any_processing,
         "gemini": gem,
     }
 
@@ -181,29 +175,40 @@ async def upload(file: UploadFile = File(...), db: AsyncSession = Depends(get_db
         raise HTTPException(status_code=413, detail="File too large")
     buffer = io.BytesIO(content)
     object_name = store_file(buffer, file.filename)
-    doc = models.Document(
-        filename=file.filename,
-        content_type=file.content_type,
-        original_path=object_name,
-        status="uploaded",
-    )
-    db.add(doc)
-    await db.commit()
-    await db.refresh(doc)
-    logger.info(f"Stored file {file.filename} as {object_name} (doc_id={doc.id})")
-    # Always inline ingest now (Celery removed)
+    if settings.use_in_memory:
+        doc_dict = memdb.create_document(file.filename, file.content_type, object_name)
+        document_id = doc_dict["id"]
+    else:
+        doc = models.Document(
+            filename=file.filename,
+            content_type=file.content_type,
+            original_path=object_name,
+            status="uploaded",
+        )
+        db.add(doc)
+        await db.commit()
+        await db.refresh(doc)
+        document_id = doc.id
+        logger.info(f"Stored file {file.filename} as {object_name} (doc_id={doc.id})")
+    # Inline ingestion
     try:
         from app.services.tasks import ingest_document
-        current_key = runtime_state.get_gemini_key("") or None
-        await ingest_document(doc.id, object_name, file.content_type, current_key)
-        await db.refresh(doc)
-        return UploadResponse(document_id=doc.id, task_id="inline", status=doc.status)
+        current_key = rt_state.get_gemini_key("") or None
+        await ingest_document(document_id, object_name, file.content_type, current_key)
+        if settings.use_in_memory:
+            status_val = memdb.get_document(document_id)["status"]  # type: ignore
+        else:
+            await db.refresh(doc)
+            status_val = doc.status
+        return UploadResponse(document_id=document_id, task_id="inline", status=status_val)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {e}")
 
 
 @router.get("/documents", response_model=list[DocumentOut])
 async def list_documents(db: AsyncSession = Depends(get_db)):
+    if settings.use_in_memory:
+        return [DocumentOut(id=d["id"], filename=d["filename"], status=d["status"]) for d in memdb.list_documents()]  # type: ignore
     res = await db.execute(select(models.Document).order_by(models.Document.created_at.desc()))
     return res.scalars().all()
 
@@ -226,6 +231,9 @@ async def ask(req: AskRequest):
             "fallback_reason": "retrieval_error",
         }
     filtered = [r for r in results if r.get("hybrid_score", r.get("score", 0)) >= settings.similarity_threshold]
+    # If threshold filtered everything but we had candidates, take the top-1 so user gets best-effort answer.
+    if not filtered and results:
+        filtered = results[:1]
     if not filtered:
         return {
             "answer": "I'm sorry, that appears to be outside the scope of the provided documents or they are still ingesting.",
@@ -234,7 +242,7 @@ async def ask(req: AskRequest):
             "latency_ms": int((time.time() - start) * 1000),
             "retrieved": 0,
             "generation_mode": "none",
-            "embed_mode": filtered[0].get("_embed_mode") if filtered else None,
+            "embed_mode": None,
             "fallback_reason": "no_results",
         }
     answer = await rag.generate_answer(req.question, filtered)
@@ -253,28 +261,33 @@ async def ask(req: AskRequest):
 
 @router.get("/summarize/{document_id}", response_model=Answer)
 async def summarize(document_id: int, db: AsyncSession = Depends(get_db)):
+    if settings.use_in_memory:
+        doc = memdb.get_document(document_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        if not doc.get("aggregated_text"):
+            raise HTTPException(status_code=400, detail="Document not ingested yet")
+        return await rag.summarize(doc["aggregated_text"])  # type: ignore
     doc = await db.get(models.Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     if not doc.aggregated_text:
         raise HTTPException(status_code=400, detail="Document not ingested yet")
-    result = await rag.summarize(doc.aggregated_text)
-    return result
+    return await rag.summarize(doc.aggregated_text)
 
 
 @router.delete("/documents/{document_id}")
 async def delete_document(document_id: int, db: AsyncSession = Depends(get_db)):
+    if settings.use_in_memory:
+        if not memdb.get_document(document_id):
+            raise HTTPException(status_code=404, detail="Not found")
+        delete_document_vectors(document_id)
+        memdb.delete_document(document_id)
+        return {"status": "deleted", "document_id": document_id}
     doc = await db.get(models.Document, document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Not found")
-    # Delete vectors first
     delete_document_vectors(document_id)
-    # Delete object in MinIO
-    try:
-        if doc.original_path:
-            minio_client.remove_object(storage_settings.minio_bucket, doc.original_path)
-    except Exception:  # pragma: no cover
-        logger.warning("Failed removing object from MinIO")
     await db.delete(doc)
     await db.commit()
     return {"status": "deleted", "document_id": document_id}
@@ -296,22 +309,25 @@ async def admin_reset(token: str):
         raise HTTPException(status_code=403, detail="Forbidden")
     # Clear runtime key
     rt_state.clear_gemini_key()
-    # Drop DB tables & recreate
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
+    if not settings.use_in_memory:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(Base.metadata.create_all)
+    else:
+        try:
+            from app.services import memdb as _m
+            _m.reset()
+        except Exception:
+            pass
     # Qdrant collection wipe
+    # Qdrant disabled – no collection deletion in pure mode
+    # Local upload dir cleanup
     try:
-        retrieval.client.delete_collection(settings.qdrant_collection)
-    except Exception:
-        pass
-    # MinIO bucket wipe (objects only)
-    try:
-        for obj in minio_client.list_objects(storage_settings.minio_bucket, recursive=True):
-            try:
-                minio_client.remove_object(storage_settings.minio_bucket, obj.object_name)
-            except Exception:  # noqa: E722
-                pass
+        import shutil, pathlib
+        up_dir = pathlib.Path("data/uploads")
+        if up_dir.exists():
+            shutil.rmtree(up_dir)
+            up_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
     # Redis purge skipped (redis removed)

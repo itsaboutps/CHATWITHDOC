@@ -1,31 +1,29 @@
-from minio import Minio
 from app.core.config import get_settings
 from typing import BinaryIO
-import uuid
+import uuid, pathlib, shutil, os
 
 settings = get_settings()
 
-_client = Minio(
-    settings.minio_endpoint.replace("http://", "").replace("https://", ""),
-    access_key=settings.minio_root_user,
-    secret_key=settings.minio_root_password,
-    secure=settings.minio_endpoint.startswith("https")
-)
-
-def ensure_bucket():
-    if not _client.bucket_exists(settings.minio_bucket):
-        _client.make_bucket(settings.minio_bucket)
-
+BASE_DIR = pathlib.Path("data/uploads")
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 def store_file(file_obj: BinaryIO, filename: str) -> str:
-    ensure_bucket()
     object_name = f"{uuid.uuid4()}_{filename}"
-    file_obj.seek(0, 2)
-    size = file_obj.tell()
+    dest = BASE_DIR / object_name
     file_obj.seek(0)
-    _client.put_object(settings.minio_bucket, object_name, file_obj, length=size)
-    return object_name
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(file_obj, f)
+    return str(dest)
 
+def read_file(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+def delete_file(path: str):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 def get_presigned(object_name: str, expires=3600) -> str:
-    return _client.presigned_get_object(settings.minio_bucket, object_name, expires=expires)
+    return object_name

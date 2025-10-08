@@ -26,7 +26,7 @@ class Answer(BaseModel):
     answer_type: Literal["factual","contextual","analytical","descriptive","summarization","out_of_scope"]
     sources: List[str] = []
     latency_ms: Optional[int] = None
-    retrieved: int | None = None
+    retrieved: Optional[int] = None
 
 class SummarizeResponse(Answer):
     pass
